@@ -1,0 +1,14 @@
+rules_version = '2';
+
+// ログインした人だけが、PDF と画像（1ファイル50MBまで）をアップロード・削除できる
+service firebase.storage {
+  match /b/{bucket}/o {
+    match /partners/{partnerId}/{fileName} {
+      allow read: if request.auth != null;
+      allow create, update: if request.auth != null
+        && request.resource.size < 50 * 1024 * 1024
+        && request.resource.contentType.matches('application/pdf|image/(png|jpeg|gif|webp)');
+      allow delete: if request.auth != null;
+    }
+  }
+}

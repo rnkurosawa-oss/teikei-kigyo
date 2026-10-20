@@ -309,6 +309,22 @@ h1, h2, h3 { font-family: var(--font-display); text-wrap: balance; margin: 0; }
 }
 .progress { font-size: 12px; color: var(--accent-strong); font-weight: 500; }
 
+/* Sign-in + banners */
+.auth-wrap { flex: 1; display: grid; place-items: center; padding-block: 24px 48px; }
+.auth-card {
+  width: min(420px, 100%); background: var(--surface); border: 1px solid var(--line); border-radius: var(--r-lg);
+  box-shadow: var(--shadow); padding: 28px 24px; display: flex; flex-direction: column; gap: 16px;
+}
+.auth-card h2 { font-size: 20px; }
+.auth-card p { margin: 0; }
+.auth-err { background: var(--bad-bg); color: var(--bad-fg); border-radius: var(--r-sm); padding: 8px 12px; font-size: 13px; }
+.user-chip { font-size: 12px; color: var(--muted); max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.banner {
+  background: var(--accent-soft); color: var(--fg); border: 1px solid var(--accent); border-radius: var(--r-md);
+  padding: 12px 14px; display: flex; flex-direction: column; gap: 8px; font-size: 13px;
+}
+.banner .row { display: flex; gap: 6px; flex-wrap: wrap; }
+
 @media (max-width: 860px) {
   .layout { grid-template-columns: minmax(0,1fr); }
   .layout.show-detail .sidebar { display: none; }
@@ -340,8 +356,9 @@ h1, h2, h3 { font-family: var(--font-display); text-wrap: balance; margin: 0; }
         <p>企画書・契約書・写真・訪問履歴を提携先ごとにまとめて管理</p>
       </div>
     </div>
-    <div class="top-actions">
-      <span class="mode-note" id="modeNote">読み込み中…</span>
+    <div class="top-actions" id="topActions" hidden>
+      <span class="user-chip" id="userChip"></span>
+      <button class="btn ghost" data-act="logout">ログアウト</button>
       <button class="btn" data-act="open-backup">バックアップ</button>
       <button class="btn primary" data-act="open-new" id="newBtn">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
@@ -350,7 +367,8 @@ h1, h2, h3 { font-family: var(--font-display); text-wrap: balance; margin: 0; }
     </div>
   </header>
 
-  <div class="layout" id="layout">
+  <div class="auth-wrap" id="authView" hidden></div>
+  <div class="layout" id="layout" hidden>
     <aside class="sidebar" id="sidebar"></aside>
     <main class="detail" id="detail"></main>
   </div>
@@ -358,10 +376,16 @@ h1, h2, h3 { font-family: var(--font-display); text-wrap: balance; margin: 0; }
 <div id="overlayRoot"></div>
 <div id="toastRoot"></div>
 
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-storage-compat.js"></script>
+<script src="config.js"></script>
 <script>
 (function () {
   "use strict";
 
+  const CFG = (window.TEIKEI_CONFIG && window.TEIKEI_CONFIG.firebase) || {};
   const CATS = [
     { key: "sdf",   label: "自衛隊",            ph: "例：陸上自衛隊 ○○駐屯地", desc: "駐屯地・基地・地方協力本部など" },
     { key: "corp",  label: "企業",              ph: "例：株式会社○○",        desc: "企画・契約を伴う業務提携" },
@@ -373,8 +397,11 @@ h1, h2, h3 { font-family: var(--font-display); text-wrap: balance; margin: 0; }
   const KINDS = { proposal: "企画書", contract: "契約書", photo: "写真" };
   const OK_TYPES = ["application/pdf", "image/png", "image/jpeg", "image/gif", "image/webp"];
   const EXT_TYPE = { pdf: "application/pdf", png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp" };
+  const TYPE_EXT = { "application/pdf": "pdf", "image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "image/webp": "webp" };
   const MAX_BYTES = 50 * 1048576;
-  const DB_NAME = "teikei-kigyo";
+  const LOCAL_DB = "teikei-kigyo";
+  const MIGRATED_KEY = "teikei-kigyo-migrated";
+  const PARTNER_FIELDS = ["name", "category", "status", "owner", "contact", "phone", "email", "address", "contractStart", "contractEnd", "memo"];
 
   const today = () => {
     const d = new Date();
@@ -384,21 +411,24 @@ h1, h2, h3 { font-family: var(--font-display); text-wrap: balance; margin: 0; }
   const blankNew = () => ({ name: "", category: state.cat !== "all" ? state.cat : "corp", status: "打診中", contact: "" });
 
   const state = {
+    session: null, authReady: false, authErr: "", authBusy: false,
     partners: {}, loaded: false,
     cat: "all", q: "", sel: null, tab: "overview",
     editing: false, draft: null, visitDraft: null, editVisitId: null,
     armed: null, uploading: null, mobileDetail: false,
-    modal: false, newDraft: null, backup: false, busy: null, lightbox: null, dragOver: false
+    modal: false, newDraft: null, backup: false, busy: null, lightbox: null, dragOver: false,
+    migrate: null
   };
   state.visitDraft = blankVisit();
 
-  let store = null;   // partner records
-  let assets = null;  // file blobs
-  const urls = {};    // assetId -> object URL
+  let auth = null, db = null, storage = null;
+  let unsubs = [];
+  const raw = { partners: null, files: null, visits: null };
+  const urls = {};   // file id -> download URL
 
   /* ---------- helpers ---------- */
   const esc = s => String(s == null ? "" : s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-  const uid = () => (window.crypto && crypto.randomUUID) ? crypto.randomUUID().replace(/-/g, "").slice(0, 20) : Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
+  const uid = () => (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : Date.now().toString(36) + Math.random().toString(36).slice(2, 12);
   const fmtDate = s => s ? s.replace(/-/g, "/") : "";
   const fmtSize = n => n == null ? "" : n < 1024 ? n + " B" : n < 1048576 ? (n / 1024).toFixed(0) + " KB" : (n / 1048576).toFixed(1) + " MB";
   const fmtStamp = iso => { if (!iso) return ""; const d = new Date(iso); return isNaN(d) ? "" : d.getFullYear() + "/" + String(d.getMonth() + 1).padStart(2, "0") + "/" + String(d.getDate()).padStart(2, "0"); };
@@ -409,6 +439,8 @@ h1, h2, h3 { font-family: var(--font-display); text-wrap: balance; margin: 0; }
   const files = (p, kind) => (p.files || []).filter(f => f.kind === kind);
   const lastVisit = p => (p.visits || []).reduce((m, v) => (!m || v.date > m) ? v.date : m, "");
   const isImg = t => /^image\//.test(t || "");
+  const now = () => new Date().toISOString();
+  const myId = () => (auth && auth.currentUser && auth.currentUser.uid) || "";
 
   function toast(msg) {
     const root = document.getElementById("toastRoot");
@@ -422,124 +454,184 @@ h1, h2, h3 { font-family: var(--font-display); text-wrap: balance; margin: 0; }
     arm._t = setTimeout(() => { if (state.armed === key) { state.armed = null; render(); } }, 4000);
   }
   function errMsg(e) {
-    const n = e && (e.name || e.code);
-    if (n === "QuotaExceededError") return "ブラウザの保存容量が足りません。不要なファイルを削除してください";
-    if (n === "too_large") return "50MBを超えています";
+    const c = String((e && e.code) || "");
+    if (/auth\/(invalid-credential|wrong-password|user-not-found|invalid-login-credentials)/.test(c)) return "メールアドレスまたはパスワードが違います";
+    if (c === "auth/invalid-email") return "メールアドレスの形式が正しくありません";
+    if (c === "auth/user-disabled") return "このアカウントは無効になっています。管理者に連絡してください";
+    if (c === "auth/too-many-requests") return "ログインの試行が多すぎます。しばらく待ってからお試しください";
+    if (c === "auth/network-request-failed" || c === "unavailable" || c === "storage/retry-limit-exceeded") return "通信できません。インターネット接続を確認してください";
+    if (c === "permission-denied" || c === "storage/unauthorized" || c === "unauthenticated" || c === "storage/unauthenticated") return "この操作をする権限がありません。ログインし直してください";
+    if (c === "storage/quota-exceeded" || c === "resource-exhausted") return "保存容量の上限に達しています。管理者に連絡してください";
+    if (c === "storage/bucket-not-found" || c === "storage/project-not-found" || c === "storage/no-default-bucket") return "ファイル保存の設定（Storage）がまだです。管理者に連絡してください";
     return "保存に失敗しました。もう一度お試しください";
   }
+  function pickPartner(p) {
+    const o = {};
+    PARTNER_FIELDS.forEach(k => { o[k] = typeof p[k] === "string" ? p[k].trim() : ""; });
+    if (!o.name) o.name = "（名称なし）";
+    if (!CAT[o.category]) o.category = "corp";
+    if (!STATUSES.includes(o.status)) o.status = "打診中";
+    return o;
+  }
 
-  /* ---------- IndexedDB ---------- */
-  function openDB() {
-    return new Promise((resolve, reject) => {
-      const r = indexedDB.open(DB_NAME, 1);
-      r.onupgradeneeded = () => {
-        const d = r.result;
-        if (!d.objectStoreNames.contains("partners")) d.createObjectStore("partners", { keyPath: "id" });
-        if (!d.objectStoreNames.contains("files")) d.createObjectStore("files", { keyPath: "id" });
-      };
-      r.onsuccess = () => resolve(r.result);
-      r.onerror = () => reject(r.error);
+  /* ---------- data (live) ---------- */
+  function assemble() {
+    if (!raw.partners || !raw.files || !raw.visits) return;
+    const m = {};
+    raw.partners.forEach(d => { m[d.id] = Object.assign({ id: d.id }, d.data, { files: [], visits: [] }); });
+    raw.files.forEach(d => {
+      const p = m[d.data.partnerId];
+      if (d.data.url) urls[d.id] = d.data.url;
+      if (p) p.files.push(Object.assign({ id: d.id, assetId: d.id }, d.data));
     });
+    raw.visits.forEach(d => { const p = m[d.data.partnerId]; if (p) p.visits.push(Object.assign({ id: d.id }, d.data)); });
+    state.partners = m; state.loaded = true;
+    if (state.sel && !m[state.sel]) { state.sel = null; state.mobileDetail = false; state.editing = false; }
+    render();
   }
-  function req(db, name, mode, fn) {
-    return new Promise((resolve, reject) => {
-      const t = db.transaction(name, mode);
-      const os = t.objectStore(name);
-      const q = fn(os);
-      let result;
-      if (q) q.onsuccess = () => { result = q.result; };
-      t.oncomplete = () => resolve(result);
-      t.onerror = () => reject(t.error);
-      t.onabort = () => reject(t.error);
-    });
+  function listen(name) {
+    return db.collection(name).onSnapshot(snap => {
+      raw[name] = snap.docs.map(d => ({ id: d.id, data: d.data() }));
+      assemble();
+    }, e => { toast(errMsg(e)); state.loaded = true; render(); });
+  }
+  function startApp() {
+    state.loaded = false;
+    render();
+    unsubs = ["partners", "files", "visits"].map(listen);
+    checkLocalData();
+  }
+  function stopApp() {
+    unsubs.forEach(u => u()); unsubs = [];
+    raw.partners = raw.files = raw.visits = null;
+    state.partners = {}; state.loaded = false; state.sel = null; state.editing = false;
+    if (state.migrate) { state.migrate.db.close(); state.migrate = null; }
+    Object.keys(urls).forEach(k => delete urls[k]);
+  }
+  const touch = id => db.collection("partners").doc(id).update({ updatedAt: now() });
+
+  async function run(fn, okMsg) {
+    try { await fn(); if (okMsg) toast(okMsg); return true; }
+    catch (e) { toast(errMsg(e)); return false; }
   }
 
-  function idbStore(db) {
-    let data = {}, listener = null;
-    const emit = () => { const m = {}; Object.keys(data).forEach(k => m[k] = data[k]); listener && listener(m); };
-    return {
-      async subscribe(cb) {
-        listener = cb;
-        const all = await req(db, "partners", "readonly", os => os.getAll());
-        (all || []).forEach(p => data[p.id] = p);
-        emit();
-      },
-      async create(d) { const id = uid(); const rec = Object.assign({ id }, d); await req(db, "partners", "readwrite", os => os.put(rec)); data[id] = rec; emit(); return id; },
-      async update(id, patch) {
-        if (!data[id]) throw new Error("not found");
-        const rec = Object.assign({}, data[id], patch);
-        await req(db, "partners", "readwrite", os => os.put(rec)); data[id] = rec; emit();
-      },
-      async remove(id) { await req(db, "partners", "readwrite", os => os.delete(id)); delete data[id]; emit(); },
-      async putRaw(rec) { await req(db, "partners", "readwrite", os => os.put(rec)); data[rec.id] = rec; },
-      all() { return Object.values(data); },
-      refresh: emit
-    };
+  async function putFile(partnerId, kind, blob, name, type, uploadedAt) {
+    const path = "partners/" + partnerId + "/" + uid() + "." + TYPE_EXT[type];
+    const ref = storage.ref(path);
+    await ref.put(blob, { contentType: type });
+    const url = await ref.getDownloadURL();
+    await db.collection("files").add({ partnerId, kind, name, path, url, type, size: blob.size, uploadedAt: uploadedAt || now(), uploadedBy: myId() });
+  }
+  async function removeStored(path) {
+    try { await storage.ref(path).delete(); }
+    catch (e) { if (e && e.code !== "storage/object-not-found") throw e; }
   }
 
-  function idbAssets(db) {
-    return {
-      async loadAll() {
-        const all = await req(db, "files", "readonly", os => os.getAll());
-        (all || []).forEach(f => { urls[f.id] = URL.createObjectURL(f.blob); });
-      },
-      async upload(file, opts) {
-        if (file.size > MAX_BYTES) throw { code: "too_large" };
-        const id = uid();
-        const blob = new Blob([file], { type: opts.type });
-        await req(db, "files", "readwrite", os => os.put({ id, blob }));
-        urls[id] = URL.createObjectURL(blob);
-        return { id, sizeBytes: blob.size, contentType: opts.type };
-      },
-      async put(id, blob) {
-        await req(db, "files", "readwrite", os => os.put({ id, blob }));
-        if (urls[id]) URL.revokeObjectURL(urls[id]);
-        urls[id] = URL.createObjectURL(blob);
-      },
-      async get(id) { const r = await req(db, "files", "readonly", os => os.get(id)); return r ? r.blob : null; },
-      async delete(id) {
-        await req(db, "files", "readwrite", os => os.delete(id));
-        if (urls[id]) { URL.revokeObjectURL(urls[id]); delete urls[id]; }
+  /* ---------- import (backup files and this browser's old data) ---------- */
+  async function importPartners(list, getBlob, onStep) {
+    let n = 0, fileErrs = 0;
+    for (const p of list) {
+      const ref = db.collection("partners").doc();
+      const t = now();
+      await ref.set(Object.assign(pickPartner(p), { createdAt: p.createdAt || t, updatedAt: p.updatedAt || t, createdBy: myId() }));
+      for (const f of (p.files || [])) {
+        try {
+          const blob = getBlob ? await getBlob(f.assetId) : null;
+          if (blob) {
+            const type = OK_TYPES.includes(blob.type) ? blob.type : (OK_TYPES.includes(f.type) ? f.type : null);
+            if (!type) { fileErrs++; continue; }
+            await putFile(ref.id, KINDS[f.kind] ? f.kind : "proposal", blob, f.name || "file." + TYPE_EXT[type], type, f.uploadedAt);
+          } else if (f.url && f.path) {
+            await db.collection("files").add({ partnerId: ref.id, kind: KINDS[f.kind] ? f.kind : "proposal", name: f.name || "file", path: f.path, url: f.url, type: f.type || "", size: f.size || 0, uploadedAt: f.uploadedAt || now(), uploadedBy: myId() });
+          } else fileErrs++;
+        } catch (e) { fileErrs++; }
       }
-    };
+      const visits = (p.visits || []).filter(v => v && v.date);
+      for (let i = 0; i < visits.length; i += 400) {
+        const batch = db.batch();
+        visits.slice(i, i + 400).forEach(v => batch.set(db.collection("visits").doc(), { partnerId: ref.id, date: v.date, person: v.person || "", purpose: v.purpose || "", notes: v.notes || "", createdAt: v.createdAt || now(), createdBy: myId() }));
+        await batch.commit();
+      }
+      n++;
+      onStep && onStep(n, list.length);
+    }
+    return { n, fileErrs };
+  }
+
+  function idbReq(idb, name, fn) {
+    return new Promise((resolve, reject) => {
+      const t = idb.transaction(name, "readonly");
+      const q = fn(t.objectStore(name));
+      q.onsuccess = () => resolve(q.result);
+      q.onerror = () => reject(q.error);
+    });
+  }
+  async function checkLocalData() {
+    try { if (localStorage.getItem(MIGRATED_KEY)) return; } catch (e) { return; }
+    if (!window.indexedDB) return;
+    const idb = await new Promise(res => {
+      try {
+        const r = indexedDB.open(LOCAL_DB);
+        r.onupgradeneeded = () => { r.transaction.abort(); };
+        r.onsuccess = () => res(r.result);
+        r.onerror = () => res(null);
+      } catch (e) { res(null); }
+    });
+    if (!idb) return;
+    if (!idb.objectStoreNames.contains("partners") || !idb.objectStoreNames.contains("files")) { idb.close(); return; }
+    try {
+      const ps = await idbReq(idb, "partners", os => os.getAll());
+      if (ps && ps.length && state.session) { state.migrate = { db: idb, partners: ps, step: null }; render(); }
+      else idb.close();
+    } catch (e) { idb.close(); }
+  }
+  async function migrateLocal() {
+    const mg = state.migrate;
+    if (!mg || mg.step) return;
+    mg.step = "0/" + mg.partners.length; render();
+    try {
+      const r = await importPartners(mg.partners, async id => { const rec = await idbReq(mg.db, "files", os => os.get(id)); return rec ? rec.blob : null; },
+        (n, t) => { mg.step = n + "/" + t; renderSidebar(); });
+      try { localStorage.setItem(MIGRATED_KEY, now()); } catch (e) {}
+      mg.db.close(); state.migrate = null;
+      toast("このブラウザのデータ " + r.n + " 件を共有データに移しました" + (r.fileErrs ? "（ファイル " + r.fileErrs + " 件は移せませんでした）" : ""));
+      render();
+    } catch (e) { mg.step = null; toast(errMsg(e)); render(); }
   }
 
   /* ---------- backup ---------- */
-  const blobToB64 = b => new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(String(r.result).split(",")[1] || ""); r.onerror = () => rej(r.error); r.readAsDataURL(b); });
+  function saveBlob(blob, name) {
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = name;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+  }
   const b64ToBlob = (b64, type) => { const bin = atob(b64); const u = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i); return new Blob([u], { type }); };
 
-  async function exportBackup() {
-    state.busy = "export"; renderOverlay();
-    try {
-      const partners = store.all();
-      const out = { app: "teikei-kigyo", version: 1, exportedAt: new Date().toISOString(), partners, files: [] };
-      for (const p of partners) for (const f of (p.files || [])) {
-        const b = await assets.get(f.assetId);
-        if (b) out.files.push({ id: f.assetId, type: b.type || f.type, data: await blobToB64(b) });
-      }
-      const blob = new Blob([JSON.stringify(out)], { type: "application/json" });
-      const a = document.createElement("a");
-      a.href = URL.createObjectURL(blob);
-      a.download = "提携企業_バックアップ_" + today() + ".json";
-      document.body.appendChild(a); a.click(); a.remove();
-      setTimeout(() => URL.revokeObjectURL(a.href), 4000);
-      toast("バックアップを保存しました（" + partners.length + "件・ファイル" + out.files.length + "件）");
-    } catch (e) { toast("バックアップの作成に失敗しました"); }
-    state.busy = null; renderOverlay();
+  function exportBackup() {
+    const partners = Object.values(state.partners);
+    const out = { app: "teikei-kigyo", version: 3, exportedAt: now(), partners, files: [] };
+    saveBlob(new Blob([JSON.stringify(out, null, 1)], { type: "application/json" }), "提携企業_バックアップ_" + today() + ".json");
+    toast("バックアップを保存しました（" + partners.length + "件）");
   }
 
   async function importBackup(file) {
     if (!file) return;
     state.busy = "import"; renderOverlay();
     try {
-      const json = JSON.parse(await file.text());
-      if (!json || json.app !== "teikei-kigyo" || !Array.isArray(json.partners)) throw new Error("format");
-      for (const f of (json.files || [])) await assets.put(f.id, b64ToBlob(f.data, f.type));
-      for (const p of json.partners) if (p && p.id) await store.putRaw(p);
-      store.refresh();
-      state.backup = false;
-      toast("復元しました（" + json.partners.length + "件）");
-    } catch (e) { toast("このファイルは読み込めません。「提携企業」のバックアップファイルを選んでください"); }
+      let json;
+      try { json = JSON.parse(await file.text()); } catch (e) { json = null; }
+      if (!json || json.app !== "teikei-kigyo" || !Array.isArray(json.partners)) {
+        toast("このファイルは読み込めません。「提携企業」のバックアップファイルを選んでください");
+      } else {
+        const byId = {};
+        (json.files || []).forEach(f => { if (f && f.data) byId[f.id] = f; });
+        const r = await importPartners(json.partners, async id => byId[id] ? b64ToBlob(byId[id].data, byId[id].type) : null);
+        state.backup = false;
+        toast("読み込みました（" + r.n + "件）" + (r.fileErrs ? "。ファイル " + r.fileErrs + " 件は読み込めませんでした" : ""));
+      }
+    } catch (e) { toast(errMsg(e)); }
     state.busy = null; renderOverlay();
   }
 
@@ -566,11 +658,48 @@ h1, h2, h3 { font-family: var(--font-display); text-wrap: balance; margin: 0; }
   function statusChip(s) { return '<span class="chip st' + (s === "提携中" ? " active" : "") + '">' + esc(s || "—") + "</span>"; }
   function catChip(k) { const c = CAT[k]; return c ? '<span class="chip ' + k + '">' + esc(c.label) + "</span>" : ""; }
 
+  /* ---------- render: sign-in ---------- */
+  function renderAuth() {
+    const el = document.getElementById("authView");
+    if (!CFG.apiKey || !CFG.projectId) {
+      el.innerHTML = '<div class="auth-card"><h2>接続設定がまだです</h2><p class="hint">config.js に Firebase の設定を入れると使えるようになります。</p></div>';
+      return;
+    }
+    if (!auth) {
+      el.innerHTML = '<div class="auth-card"><h2>読み込めませんでした</h2><p class="hint">通信状況を確認して、ページを再読み込みしてください。</p></div>';
+      return;
+    }
+    if (!state.authReady) { el.innerHTML = '<div class="auth-card"><p class="hint">読み込み中…</p></div>'; return; }
+    if (el.querySelector("#l-email")) {
+      el.querySelector(".auth-err-slot").innerHTML = state.authErr ? '<div class="auth-err" role="alert">' + esc(state.authErr) + "</div>" : "";
+      const b = el.querySelector("#l-submit");
+      b.disabled = state.authBusy; b.textContent = state.authBusy ? "ログイン中…" : "ログイン";
+      return;
+    }
+    el.innerHTML = '<form class="auth-card" data-form="login">' +
+      "<h2>ログイン</h2>" +
+      '<p class="hint">管理者から受け取ったメールアドレスとパスワードを入力してください。どのパソコン・スマートフォンからでも同じデータを見られます。</p>' +
+      '<div class="auth-err-slot">' + (state.authErr ? '<div class="auth-err" role="alert">' + esc(state.authErr) + "</div>" : "") + "</div>" +
+      '<div class="field"><label for="l-email">メールアドレス</label><input id="l-email" type="email" autocomplete="username" required></div>' +
+      '<div class="field"><label for="l-pass">パスワード</label><input id="l-pass" type="password" autocomplete="current-password" required></div>' +
+      '<button class="btn primary" id="l-submit" type="submit">ログイン</button>' +
+      '<p class="hint">アカウントの追加やパスワードの再設定は、管理者が Firebase の管理画面から行います。</p>' +
+      "</form>";
+  }
+
   /* ---------- render: sidebar ---------- */
   function renderSidebar() {
     const c = counts();
     const list = filtered();
-    let h = '<div class="cats" role="group" aria-label="カテゴリー">';
+    let h = "";
+    if (state.migrate) {
+      const mg = state.migrate;
+      h += '<div class="banner"><div><b>このブラウザに以前のデータが <span class="num">' + mg.partners.length + "</span> 件あります。</b><br>共有データに移すと、ほかの端末からも見られるようになります。</div>" +
+        (mg.step ? '<span class="progress">移行中 <span class="num">' + esc(mg.step) + "</span></span>" :
+          '<div class="row"><button class="btn primary sm" data-act="migrate">共有データに移す</button><button class="btn ghost sm" data-act="skip-migrate">' + (state.armed === "skip-migrate" ? "もう一度押すと非表示" : "移さない") + "</button></div>") +
+        "</div>";
+    }
+    h += '<div class="cats" role="group" aria-label="カテゴリー">';
     h += '<button class="cat-tab all" data-act="cat" data-v="all" aria-pressed="' + (state.cat === "all") + '"><span class="lbl">すべての提携先</span><span class="cnt num">' + c.all + '<small>件</small></span></button>';
     CATS.forEach(k => {
       h += '<button class="cat-tab" data-act="cat" data-v="' + k.key + '" aria-pressed="' + (state.cat === k.key) + '"><span class="lbl"><span class="dot ' + k.key + '"></span>' + esc(k.label) + '</span><span class="cnt num">' + c[k.key] + '<small>件</small></span></button>';
@@ -595,10 +724,10 @@ h1, h2, h3 { font-family: var(--font-display); text-wrap: balance; margin: 0; }
       });
       h += "</ul>";
     }
-    const sb = document.getElementById("sidebar");
+    const el = document.getElementById("sidebar");
     const hadFocus = document.activeElement && document.activeElement.id === "q";
     const caret = hadFocus ? document.activeElement.selectionStart : null;
-    sb.innerHTML = h;
+    el.innerHTML = h;
     if (hadFocus) { const q = document.getElementById("q"); q.focus(); try { q.setSelectionRange(caret, caret); } catch (e) {} }
   }
 
@@ -609,8 +738,8 @@ h1, h2, h3 { font-family: var(--font-display); text-wrap: balance; margin: 0; }
     h += '<div class="wgrid">';
     CATS.forEach(c => { h += '<div class="wcard ' + c.key + '"><b>' + esc(c.label) + "</b><span>" + esc(c.desc) + "</span></div>"; });
     h += "</div>";
-    h += '<div class="notice"><b>データはこのブラウザの中だけに保存されます。</b>ほかのパソコンやスマートフォンからは見えません。ブラウザの履歴・サイトデータを消すと失われるため、右上の「バックアップ」から定期的にファイルへ保存してください。</div>';
-    h += '<div><button class="btn primary" data-act="open-new">最初の提携先を追加</button></div>';
+    h += '<div class="notice"><b>データはチームで共有されています。</b>ログインした人なら、どのパソコン・スマートフォンからでも同じ内容を見て編集できます。ほかの人の変更は自動で画面に反映されます。</div>';
+    h += '<div><button class="btn primary" data-act="open-new">提携先を追加</button></div>';
     h += "</div>";
     return h;
   }
@@ -727,7 +856,6 @@ h1, h2, h3 { font-family: var(--font-display); text-wrap: balance; margin: 0; }
       h += '<li class="frow"><div class="ficon">' + (isImg(f.type) && u ? '<img loading="lazy" src="' + u + '" alt="">' : esc(ext || "FILE")) + "</div>" +
         '<div class="finfo"><a href="' + u + '" target="_blank" rel="noopener">' + esc(f.name) + '</a><div class="fm num">' + fmtSize(f.size) + " ・ " + fmtStamp(f.uploadedAt) + " 追加</div></div>" +
         '<div class="factions"><a class="btn sm" href="' + u + '" target="_blank" rel="noopener">開く</a>' +
-        '<a class="btn sm" href="' + u + '" download="' + esc(f.name) + '">保存</a>' +
         '<button class="btn sm ' + (armed ? "armed" : "danger") + '" data-act="del-file" data-v="' + esc(f.assetId) + '">' + (armed ? "削除する" : "削除") + "</button>" +
         "</div></li>";
     });
@@ -739,7 +867,7 @@ h1, h2, h3 { font-family: var(--font-display); text-wrap: balance; margin: 0; }
     const accept = kind === "photo" ? "image/png,image/jpeg,image/gif,image/webp" : "application/pdf,image/png,image/jpeg,image/gif,image/webp";
     return '<div class="dropzone' + (state.dragOver === kind ? " over" : "") + '" data-drop="' + kind + '">' +
       "<p><strong>ここにファイルをドラッグ</strong><br>複数まとめて追加できます</p>" +
-      (up ? '<span class="progress">保存中 <span class="num">' + up.done + "/" + up.total + "</span></span>" :
+      (up ? '<span class="progress">アップロード中 <span class="num">' + up.done + "/" + up.total + "</span></span>" :
         '<label class="btn primary">ファイルを選ぶ<input type="file" hidden multiple accept="' + accept + '" data-upload="' + kind + '"></label>') +
       "</div>";
   }
@@ -804,10 +932,10 @@ h1, h2, h3 { font-family: var(--font-display); text-wrap: balance; margin: 0; }
     if (state.backup) {
       const busy = state.busy;
       h += '<div class="overlay" data-act="close-backup-bg"><div class="modal" role="dialog" aria-modal="true" aria-labelledby="bkTitle">';
-      h += '<h2 id="bkTitle">バックアップと復元</h2>';
-      h += '<p class="hint">データはこのブラウザの中だけに保存されています。ブラウザのデータを消すと失われるので、定期的にバックアップファイルを保存してください。別のパソコンへ移すときも、このファイルで復元できます。</p>';
-      h += '<div class="card-form" style="display:flex;flex-direction:column;gap:10px"><b>バックアップを保存</b><p class="hint">すべての提携先と、企画書・契約書・写真をひとつのファイル（.json）にまとめて保存します。</p><div><button class="btn primary" data-act="export"' + (busy ? " disabled" : "") + ">" + (busy === "export" ? "作成中…" : "バックアップを保存") + "</button></div></div>";
-      h += '<div class="card-form" style="display:flex;flex-direction:column;gap:10px"><b>バックアップから復元</b><p class="hint">選んだファイルの内容を追加します。同じ提携先はファイルの内容で上書きされます。</p><div><label class="btn"' + (busy ? ' aria-disabled="true"' : "") + ">" + (busy === "import" ? "復元中…" : "ファイルを選んで復元") + '<input type="file" hidden accept="application/json,.json" data-import="1"' + (busy ? " disabled" : "") + "></label></div></div>";
+      h += '<h2 id="bkTitle">バックアップと読み込み</h2>';
+      h += '<p class="hint">データはインターネット上（Firebase）に保存されていますが、念のため手元にも控えを残せます。</p>';
+      h += '<div class="card-form" style="display:flex;flex-direction:column;gap:10px"><b>バックアップを保存</b><p class="hint">すべての提携先・訪問履歴と、ファイルの一覧（名前とリンク）を1つのファイル（.json）に保存します。PDF や写真そのものは Firebase に残ります。</p><div><button class="btn primary" data-act="export"' + (busy ? " disabled" : "") + ">バックアップを保存</button></div></div>";
+      h += '<div class="card-form" style="display:flex;flex-direction:column;gap:10px"><b>バックアップを読み込む</b><p class="hint">ファイルの内容を新しい提携先として追加します。以前のブラウザ保存版で作ったバックアップ（PDF・写真入り）も読み込めます。同じファイルを2回読み込むと、同じ提携先が2件ずつになります。</p><div><label class="btn"' + (busy ? ' aria-disabled="true"' : "") + ">" + (busy === "import" ? "読み込み中…" : "ファイルを選んで読み込む") + '<input type="file" hidden accept="application/json,.json" data-import="1"' + (busy ? " disabled" : "") + "></label></div></div>";
       h += '<div class="form-actions"><button class="btn" data-act="close-backup">閉じる</button></div>';
       h += "</div></div>";
     }
@@ -822,7 +950,7 @@ h1, h2, h3 { font-family: var(--font-display); text-wrap: balance; margin: 0; }
           '<div class="lb-bar">' + (ph.length > 1 ? '<button class="btn sm" data-act="lb-step" data-v="-1">← 前</button>' : "") +
           '<span>' + esc(f.name) + ' ・ <span class="num">' + (i + 1) + "/" + ph.length + "</span></span>" +
           (ph.length > 1 ? '<button class="btn sm" data-act="lb-step" data-v="1">次 →</button>' : "") +
-          '<a class="btn sm" href="' + u + '" download="' + esc(f.name) + '">保存</a><button class="btn sm" data-act="close-lb">閉じる</button></div></div>';
+          '<a class="btn sm" href="' + u + '" target="_blank" rel="noopener">原寸で開く</a><button class="btn sm" data-act="close-lb">閉じる</button></div></div>';
       } else state.lightbox = null;
     }
     root.innerHTML = h;
@@ -830,41 +958,54 @@ h1, h2, h3 { font-family: var(--font-display); text-wrap: balance; margin: 0; }
   }
 
   function render() {
+    const signedIn = !!state.session;
+    document.getElementById("authView").hidden = signedIn;
+    document.getElementById("layout").hidden = !signedIn;
+    document.getElementById("topActions").hidden = !signedIn;
+    if (!signedIn) { renderAuth(); document.getElementById("overlayRoot").innerHTML = ""; return; }
+    document.getElementById("userChip").textContent = state.session.email || "";
     renderSidebar();
     renderDetail();
     renderOverlay();
   }
 
   /* ---------- actions ---------- */
-  const now = () => new Date().toISOString();
-
-  async function patch(id, data, okMsg) {
-    try { await store.update(id, Object.assign({}, data, { updatedAt: now() })); if (okMsg) toast(okMsg); return true; }
-    catch (e) { toast(errMsg(e)); return false; }
+  async function login(email, password) {
+    state.authBusy = true; state.authErr = ""; renderAuth();
+    try { await auth.signInWithEmailAndPassword(email, password); }
+    catch (e) { state.authErr = errMsg(e); }
+    state.authBusy = false;
+    if (!state.session) renderAuth();
   }
 
   async function createPartner() {
     const d = state.newDraft;
     if (!d.name.trim()) { toast("名称を入力してください"); return; }
+    const ref = db.collection("partners").doc();
     const t = now();
-    try {
-      const id = await store.create({ name: d.name.trim(), category: d.category, status: d.status, contact: d.contact.trim(), owner: "", phone: "", email: "", address: "", contractStart: "", contractEnd: "", memo: "", files: [], visits: [], createdAt: t, updatedAt: t });
-      state.modal = false; state.sel = id; state.tab = "overview"; state.editing = false; state.mobileDetail = true;
+    const data = Object.assign(pickPartner(d), { createdAt: t, updatedAt: t, createdBy: myId() });
+    const ok = await run(() => ref.set(data), "「" + data.name + "」を登録しました");
+    if (ok) {
+      state.modal = false; state.sel = ref.id; state.tab = "overview"; state.editing = false; state.mobileDetail = true;
       state.visitDraft = blankVisit(); state.editVisitId = null;
-      if (state.cat !== "all" && state.cat !== d.category) state.cat = d.category;
-      toast("「" + d.name.trim() + "」を登録しました");
+      if (state.cat !== "all" && state.cat !== data.category) state.cat = data.category;
       render();
-    } catch (e) { toast(errMsg(e)); }
+    }
   }
 
   async function deletePartner(p) {
-    const ids = (p.files || []).map(f => f.assetId);
-    try { await store.remove(p.id); }
-    catch (e) { toast(errMsg(e)); return; }
-    for (const id of ids) { try { await assets.delete(id); } catch (e) {} }
-    state.sel = null; state.mobileDetail = false; state.editing = false;
-    toast("「" + p.name + "」を削除しました");
-    render();
+    const ok = await run(async () => {
+      for (const f of (p.files || [])) await removeStored(f.path);
+      const refs = (p.files || []).map(f => db.collection("files").doc(f.id))
+        .concat((p.visits || []).map(v => db.collection("visits").doc(v.id)));
+      for (let i = 0; i < refs.length; i += 400) {
+        const batch = db.batch();
+        refs.slice(i, i + 400).forEach(r => batch.delete(r));
+        await batch.commit();
+      }
+      await db.collection("partners").doc(p.id).delete();
+    }, "「" + p.name + "」を削除しました");
+    if (ok) { state.sel = null; state.mobileDetail = false; state.editing = false; render(); }
   }
 
   async function uploadFiles(kind, fileList) {
@@ -875,38 +1016,39 @@ h1, h2, h3 { font-family: var(--font-display); text-wrap: balance; margin: 0; }
     const pid = p.id;
     state.uploading = { kind, done: 0, total: arr.length };
     render();
-    const added = [], errs = [];
+    let added = 0;
+    const errs = [];
     for (const f of arr) {
       const ext = (f.name.split(".").pop() || "").toLowerCase();
       const type = OK_TYPES.includes(f.type) ? f.type : EXT_TYPE[ext];
       if (!type || (kind === "photo" && !type.startsWith("image/"))) {
         errs.push(f.name + "：" + (ext === "heic" ? "HEIC形式は未対応です。JPEGで保存し直してください" : "対応していない形式です（PDF・JPEG・PNG・GIF・WebP）"));
+      } else if (f.size > MAX_BYTES) {
+        errs.push(f.name + "：50MBを超えています");
       } else {
-        try {
-          const r = await assets.upload(f, { type });
-          added.push({ assetId: r.id, name: f.name, type: r.contentType, size: r.sizeBytes, kind, uploadedAt: now() });
-        } catch (e) { errs.push(f.name + "：" + errMsg(e)); }
+        try { await putFile(pid, kind, f, f.name, type); added++; }
+        catch (e) { errs.push(f.name + "：" + errMsg(e)); }
       }
       state.uploading.done++;
       renderDetail();
     }
     state.uploading = null;
-    if (added.length) {
-      const cur = state.partners[pid] || p;
-      await patch(pid, { files: (cur.files || []).concat(added) }, errs.length ? null : KINDS[kind] + "を " + added.length + " 件追加しました");
-    }
+    if (added) { try { await touch(pid); } catch (e) {} }
     if (errs.length) toast(errs.join(" / "));
+    else if (added) toast(KINDS[kind] + "を " + added + " 件追加しました");
     render();
   }
 
-  async function deleteFile(assetId) {
+  async function deleteFile(fileId) {
     const p = state.partners[state.sel];
-    if (!p) return;
-    const f = (p.files || []).find(x => x.assetId === assetId);
-    try { await assets.delete(assetId); } catch (e) { toast(errMsg(e)); return; }
-    await patch(p.id, { files: (p.files || []).filter(x => x.assetId !== assetId) }, (f ? f.name : "ファイル") + " を削除しました");
-    if (state.lightbox === assetId) state.lightbox = null;
-    render();
+    const f = p && (p.files || []).find(x => x.assetId === fileId);
+    if (!f) return;
+    const ok = await run(async () => {
+      await removeStored(f.path);
+      await db.collection("files").doc(f.id).delete();
+      await touch(p.id);
+    }, f.name + " を削除しました");
+    if (ok && state.lightbox === fileId) { state.lightbox = null; renderOverlay(); }
   }
 
   async function saveVisit() {
@@ -914,12 +1056,19 @@ h1, h2, h3 { font-family: var(--font-display); text-wrap: balance; margin: 0; }
     const d = state.visitDraft;
     if (!p) return;
     if (!d.date) { toast("訪問日を入力してください"); return; }
-    let visits = (p.visits || []).slice();
     const clean = { date: d.date, person: d.person.trim(), purpose: d.purpose.trim(), notes: d.notes.trim() };
-    if (state.editVisitId) visits = visits.map(v => v.id === state.editVisitId ? Object.assign({}, v, clean) : v);
-    else visits.push(Object.assign({ id: uid(), createdAt: now() }, clean));
-    const ok = await patch(p.id, { visits }, state.editVisitId ? "訪問記録を更新しました" : "訪問を記録しました");
+    const editing = state.editVisitId;
+    const ok = await run(async () => {
+      if (editing) await db.collection("visits").doc(editing).update(clean);
+      else await db.collection("visits").add(Object.assign({ partnerId: p.id, createdAt: now(), createdBy: myId() }, clean));
+      await touch(p.id);
+    }, editing ? "訪問記録を更新しました" : "訪問を記録しました");
     if (ok) { state.visitDraft = blankVisit(); state.editVisitId = null; render(); }
+  }
+
+  async function deleteVisit(p, id) {
+    if (state.editVisitId === id) { state.editVisitId = null; state.visitDraft = blankVisit(); }
+    await run(async () => { await db.collection("visits").doc(id).delete(); await touch(p.id); }, "訪問記録を削除しました");
   }
 
   async function saveEdit() {
@@ -927,10 +1076,7 @@ h1, h2, h3 { font-family: var(--font-display); text-wrap: balance; margin: 0; }
     const d = state.draft;
     if (!p || !d) return;
     if (!d.name.trim()) { toast("名称を入力してください"); return; }
-    const fields = ["name", "category", "status", "owner", "contact", "phone", "email", "address", "contractStart", "contractEnd", "memo"];
-    const out = {};
-    fields.forEach(k => out[k] = typeof d[k] === "string" ? d[k].trim() : (d[k] || ""));
-    const ok = await patch(p.id, out, "基本情報を保存しました");
+    const ok = await run(() => db.collection("partners").doc(p.id).update(Object.assign(pickPartner(d), { updatedAt: now() })), "基本情報を保存しました");
     if (ok) { state.editing = false; state.draft = null; render(); }
   }
 
@@ -938,10 +1084,19 @@ h1, h2, h3 { font-family: var(--font-display); text-wrap: balance; margin: 0; }
   document.addEventListener("click", e => {
     const t = e.target.closest("[data-act]");
     if (!t) return;
-    if (!store && t.dataset.act !== "close-modal") return;
     const act = t.dataset.act, v = t.dataset.v;
     const p = state.sel && state.partners[state.sel];
     switch (act) {
+      case "logout": auth && auth.signOut(); break;
+      case "migrate": migrateLocal(); break;
+      case "skip-migrate":
+        if (state.armed === "skip-migrate") {
+          state.armed = null;
+          try { localStorage.setItem(MIGRATED_KEY, "skipped"); } catch (err) {}
+          if (state.migrate) state.migrate.db.close();
+          state.migrate = null; render();
+        } else { arm("skip-migrate"); render(); }
+        break;
       case "cat": state.cat = v; render(); break;
       case "select":
         if (state.sel !== t.dataset.id) { state.tab = "overview"; state.editing = false; state.draft = null; state.visitDraft = blankVisit(); state.editVisitId = null; state.armed = null; }
@@ -963,7 +1118,7 @@ h1, h2, h3 { font-family: var(--font-display); text-wrap: balance; margin: 0; }
         break;
       case "edit":
         state.draft = {};
-        ["name", "category", "status", "owner", "contact", "phone", "email", "address", "contractStart", "contractEnd", "memo"].forEach(k => state.draft[k] = (p && p[k]) || "");
+        PARTNER_FIELDS.forEach(k => state.draft[k] = (p && p[k]) || "");
         state.editing = true; state.tab = "overview"; render(); break;
       case "cancel-edit": state.editing = false; state.draft = null; render(); break;
       case "del-partner":
@@ -973,11 +1128,7 @@ h1, h2, h3 { font-family: var(--font-display); text-wrap: balance; margin: 0; }
         if (state.armed === "del-file-" + v) { state.armed = null; deleteFile(v); } else { arm("del-file-" + v); render(); }
         break;
       case "del-visit":
-        if (state.armed === "del-visit-" + v) {
-          state.armed = null;
-          if (state.editVisitId === v) { state.editVisitId = null; state.visitDraft = blankVisit(); }
-          patch(p.id, { visits: (p.visits || []).filter(x => x.id !== v) }, "訪問記録を削除しました");
-        } else { arm("del-visit-" + v); render(); }
+        if (state.armed === "del-visit-" + v) { state.armed = null; deleteVisit(p, v); } else { arm("del-visit-" + v); render(); }
         break;
       case "edit-visit": {
         const vv = (p.visits || []).find(x => x.id === v);
@@ -1012,9 +1163,9 @@ h1, h2, h3 { font-family: var(--font-display); text-wrap: balance; margin: 0; }
   });
   document.addEventListener("submit", e => {
     e.preventDefault();
-    if (!store) return;
     const f = e.target.dataset.form;
-    if (f === "new") createPartner();
+    if (f === "login") { if (!state.authBusy) login(document.getElementById("l-email").value.trim(), document.getElementById("l-pass").value); }
+    else if (f === "new") createPartner();
     else if (f === "edit") saveEdit();
     else if (f === "visit") saveVisit();
   });
@@ -1048,27 +1199,24 @@ h1, h2, h3 { font-family: var(--font-display); text-wrap: balance; margin: 0; }
   });
 
   /* ---------- boot ---------- */
-  function setMode(text) { document.getElementById("modeNote").textContent = text; }
-
-  async function boot() {
-    render();
-    try {
-      const db = await openDB();
-      assets = idbAssets(db);
-      await assets.loadAll();
-      store = idbStore(db);
-      await store.subscribe(m => {
-        state.partners = m; state.loaded = true;
-        if (state.sel && !m[state.sel]) { state.sel = null; state.mobileDetail = false; state.editing = false; }
-        render();
-      });
-      setMode("このブラウザに保存");
-      try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch (e) {}
-    } catch (e) {
-      setMode("保存できません");
-      state.loaded = true; render();
-      toast("このブラウザではデータを保存できません。プライベートブラウズを解除してお試しください");
+  function boot() {
+    if (CFG.apiKey && CFG.projectId && window.firebase && firebase.initializeApp) {
+      try {
+        firebase.initializeApp(CFG);
+        auth = firebase.auth();
+        db = firebase.firestore();
+        storage = firebase.storage();
+        auth.onAuthStateChanged(user => {
+          const was = !!state.session;
+          state.authReady = true;
+          state.session = user ? { uid: user.uid, email: user.email || "" } : null;
+          if (user && !was) startApp();
+          else if (!user && was) { stopApp(); state.authErr = ""; }
+          render();
+        });
+      } catch (e) { auth = null; }
     }
+    render();
   }
   boot();
 })();
