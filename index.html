@@ -4,6 +4,12 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>提携企業</title>
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="icon" href="icon-192.png" sizes="192x192" type="image/png">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<link rel="manifest" href="manifest.webmanifest">
+<meta name="theme-color" content="#f4a3c0">
+<meta name="apple-mobile-web-app-title" content="提携企業">
 <meta name="description" content="業務提携先を自衛隊・企業・企業（チラシのみ）・店舗に分けて、企画書・契約書・写真・訪問履歴をまとめて管理するアプリ">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -82,10 +88,7 @@ h1, h2, h3 { font-family: var(--font-display); text-wrap: balance; margin: 0; }
   padding-block: 18px; max-width: 1280px; width: 100%; margin-inline: auto;
 }
 .brand { display: flex; align-items: center; gap: 12px; min-width: 0; }
-.brand-mark {
-  width: 40px; height: 40px; border-radius: 12px; background: var(--accent); flex: none;
-  display: grid; place-items: center; color: var(--on-accent);
-}
+.brand-mark { width: 44px; height: 44px; flex: none; display: block; }
 .brand h1 { font-size: 22px; font-weight: 700; letter-spacing: .02em; }
 .brand p { margin: 0; font-size: 12px; color: var(--muted); }
 .top-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
@@ -348,9 +351,7 @@ h1, h2, h3 { font-family: var(--font-display); text-wrap: balance; margin: 0; }
 <div class="app">
   <header class="topbar">
     <div class="brand">
-      <div class="brand-mark" aria-hidden="true">
-        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5a2 2 0 0 1 2-2h8l6 6v10a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2z" fill="none"/><path d="M14 3v6h6"/><path d="M8 14h8M8 18h5"/></svg>
-      </div>
+      <img class="brand-mark" src="icon.svg" alt="" width="44" height="44">
       <div>
         <h1>提携企業</h1>
         <p>企画書・契約書・写真・訪問履歴を提携先ごとにまとめて管理</p>
